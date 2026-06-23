@@ -10,6 +10,7 @@
 #include "../ArgumentList.h"
 #include "TypeUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Target/LLVMIR/Import.h"
@@ -67,24 +68,25 @@ static cl::opt<bool>
     CombinedStructABI("struct-abi", cl::init(true),
                       cl::desc("Use literal LLVM ABI for structs"));
 
+static mlir::FloatType getComplexElementType(mlir::Type ty) {
+  if (auto ct = dyn_cast<mlir::ComplexType>(ty))
+    return ct.getElementType().cast<mlir::FloatType>();
+  if (auto mt = dyn_cast<mlir::MemRefType>(ty))
+    return getComplexElementType(mt.getElementType());
+  if (auto st = dyn_cast<mlir::LLVM::LLVMStructType>(ty))
+    return st.getBody()[0].cast<mlir::FloatType>();
+  return ty.cast<mlir::FloatType>();
+}
+
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
                                               mlir::Value imag,
                                               clang::QualType cty) {
-  bool ref;
   mlir::Type elty = getMLIRType(cty);
-  mlir::Type mt;
-  OpBuilder abuilder(builder.getContext());
-  abuilder.setInsertionPointToStart(allocationScope);
-  mlir::Value result;
-  if (auto MT = dyn_cast<MemRefType>(elty)) {
-    mt = elty;
-    elty = MT.getElementType();
-    ref = true;
-    result = abuilder.create<mlir::memref::AllocaOp>(loc, MT);
-  } else {
-    ref = false;
-  }
+  if (isa<mlir::ComplexType>(elty))
+    return ValueCategory(
+        builder.create<mlir::complex::CreateOp>(loc, elty, real, imag),
+        /*isReference*/ false);
 
   if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(elty)) {
     mlir::Value str = builder.create<polygeist::UndefOp>(loc, ST);
@@ -92,19 +94,10 @@ ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               builder.getDenseI64ArrayAttr(0));
     str = builder.create<LLVM::InsertValueOp>(loc, ST, str, imag,
                                               builder.getDenseI64ArrayAttr(1));
-    if (ref) {
-      builder.create<mlir::memref::StoreOp>(loc, str, result,
-                                            getConstantIndex(0));
-    } else {
-      result = str;
-    }
-  } else {
-    builder.create<mlir::memref::StoreOp>(loc, real, result,
-                                          getConstantIndex(0));
-    builder.create<mlir::memref::StoreOp>(loc, imag, result,
-                                          getConstantIndex(1));
+    return ValueCategory(str, /*isReference*/ false);
   }
-  return ValueCategory(result, /*isReference*/ ref);
+
+  llvm_unreachable("unexpected complex type");
 }
 
 ValueCategory MLIRScanner::getComplexPartRef(mlir::Location loc,
@@ -159,6 +152,22 @@ ValueCategory MLIRScanner::getComplexPartRef(mlir::Location loc,
 /// Get real (fnum = 0) or imaginary (fnum = 1) part of a complex float
 mlir::Value MLIRScanner::getComplexPart(mlir::Location loc, mlir::Value complex,
                                         int fnum) {
+  auto ty = complex.getType();
+  if (auto mt = dyn_cast<mlir::MemRefType>(ty)) {
+    if (isa<mlir::ComplexType>(mt.getElementType()))
+      complex = builder.create<mlir::memref::LoadOp>(loc, complex,
+                                                     getConstantIndex(0));
+  } else if (auto pt = dyn_cast<mlir::LLVM::LLVMPointerType>(ty)) {
+    if (isa<mlir::ComplexType>(pt.getElementType()))
+      complex = builder.create<mlir::LLVM::LoadOp>(loc, complex);
+  }
+
+  if (isa<mlir::ComplexType>(complex.getType())) {
+    if (fnum == 0)
+      return builder.create<mlir::complex::ReOp>(loc, complex);
+    return builder.create<mlir::complex::ImOp>(loc, complex);
+  }
+
   if (auto ft = dyn_cast<mlir::FloatType>(complex.getType())) {
     if (fnum == 0)
       return complex;
@@ -697,20 +706,7 @@ ValueCategory MLIRScanner::VisitFloatingLiteral(clang::FloatingLiteral *expr) {
 ValueCategory
 MLIRScanner::VisitImaginaryLiteral(clang::ImaginaryLiteral *expr) {
   auto loc = getMLIRLocation(expr->getExprLoc());
-  auto convertedType = getMLIRType(expr->getType());
-  mlir::FloatType fty;
-  if (auto mt = dyn_cast<MemRefType>(convertedType)) {
-    auto elty = mt.getElementType();
-    if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(elty)) {
-      fty = ST.getBody()[0].cast<FloatType>();
-    } else {
-      fty = elty.cast<FloatType>();
-    }
-  } else if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(convertedType)) {
-    fty = ST.getBody()[0].cast<FloatType>();
-  } else {
-    llvm_unreachable("unexpected complex type\n");
-  }
+  auto fty = getComplexElementType(getMLIRType(expr->getType()));
 
   auto zero = builder.create<ConstantFloatOp>(
       loc, APFloat(fty.getFloatSemantics(), "0"), fty);
@@ -792,6 +788,15 @@ mlir::Attribute MLIRScanner::InitializeValueByInitListExpr(mlir::Value toInit,
           bool inner) -> mlir::DenseElementsAttr {
     Location loc = toInit.getLoc();
     if (InitListExpr *initListExpr = dyn_cast<InitListExpr>(expr)) {
+      if (isa<clang::ComplexType>(expr->getType())) {
+        assert(initListExpr->getNumInits() == 2);
+        auto real = Visit(initListExpr->getInit(0)).getValue(loc, builder);
+        auto imag = Visit(initListExpr->getInit(1)).getValue(loc, builder);
+        auto val = createComplexFloat(loc, real, imag, expr->getType())
+                       .getValue(loc, builder);
+        ValueCategory(toInit, /*isReference*/ true).store(loc, builder, val);
+        return mlir::DenseElementsAttr();
+      }
 
       if (inner) {
         if (auto mt = dyn_cast<MemRefType>(toInit.getType())) {
@@ -2213,7 +2218,10 @@ ValueCategory MLIRScanner::VisitUnaryOperator(clang::UnaryOperator *U) {
   case clang::UnaryOperator::Opcode::UO_Minus: {
     mlir::Value val = sub.getValue(loc, builder);
     auto ty = val.getType();
-    if (auto ft = dyn_cast<mlir::FloatType>(ty)) {
+    if (isa<mlir::ComplexType>(ty)) {
+      return ValueCategory(builder.create<mlir::complex::NegOp>(loc, val),
+                           /*isReference*/ false);
+    } else if (auto ft = dyn_cast<mlir::FloatType>(ty)) {
       if (auto CI = val.getDefiningOp<ConstantFloatOp>()) {
         auto api = CI.getValue().cast<FloatAttr>().getValue();
         return ValueCategory(builder.create<arith::ConstantOp>(
@@ -2335,6 +2343,14 @@ ValueCategory MLIRScanner::VisitUnaryOperator(clang::UnaryOperator *U) {
     int fnum =
         (U->getOpcode() == clang::UnaryOperator::Opcode::UO_Real) ? 0 : 1;
     assert(sub.isReference);
+    if (auto mt = dyn_cast<mlir::MemRefType>(sub.val.getType()))
+      if (isa<mlir::ComplexType>(mt.getElementType()))
+        return ValueCategory(getComplexPart(loc, sub.val, fnum),
+                             /*isReference*/ false);
+    if (auto pt = dyn_cast<mlir::LLVM::LLVMPointerType>(sub.val.getType()))
+      if (isa<mlir::ComplexType>(pt.getElementType()))
+        return ValueCategory(getComplexPart(loc, sub.val, fnum),
+                             /*isReference*/ false);
     return getComplexPartRef(loc, sub.val, fnum);
   }
   default: {
@@ -2584,6 +2600,29 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
     return ValueCategory(res, /*isReference*/ false);
   };
 
+  if (BO->getOpcode() == clang::BinaryOperator::Opcode::BO_Assign)
+    if (auto uop = dyn_cast<clang::UnaryOperator>(
+            BO->getLHS()->IgnoreParenImpCasts()))
+      if (uop->getOpcode() == clang::UnaryOperator::Opcode::UO_Real ||
+          uop->getOpcode() == clang::UnaryOperator::Opcode::UO_Imag) {
+        int fnum =
+            (uop->getOpcode() == clang::UnaryOperator::Opcode::UO_Real) ? 0
+                                                                        : 1;
+        auto sub = Visit(uop->getSubExpr());
+        assert(sub.isReference);
+        auto old = sub.getValue(loc, builder);
+        if (isa<mlir::ComplexType>(old.getType())) {
+          auto rhs = Visit(BO->getRHS()).getValue(loc, builder);
+          auto real = fnum == 0 ? rhs : getComplexPart(loc, old, 0);
+          auto imag = fnum == 1 ? rhs : getComplexPart(loc, old, 1);
+          auto next = createComplexFloat(loc, real, imag,
+                                         uop->getSubExpr()->getType())
+                          .getValue(loc, builder);
+          sub.store(loc, builder, next);
+          return ValueCategory(rhs, /*isReference*/ false);
+        }
+      }
+
   auto lhs = Visit(BO->getLHS());
   if (!lhs.val && BO->getOpcode() != clang::BinaryOperator::Opcode::BO_Comma) {
     BO->dump();
@@ -2698,6 +2737,16 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
     if (bit->isSignedInteger())
       signedType = true;
   }
+  auto getComplexValue = [&](ValueCategory val) -> mlir::Value {
+    mlir::Value v = val.getValue(loc, builder);
+    if (isa<mlir::ComplexType>(v.getType()))
+      return v;
+    auto ft = v.getType().cast<mlir::FloatType>();
+    auto zero = builder.create<ConstantFloatOp>(
+        loc, APFloat::getZero(ft.getFloatSemantics()), ft);
+    return builder.create<mlir::complex::CreateOp>(
+        loc, getMLIRType(BO->getType()), v, zero);
+  };
   switch (BO->getOpcode()) {
   case clang::BinaryOperator::Opcode::BO_Shr: {
     auto lhsv = lhs.getValue(loc, builder);
@@ -2831,7 +2880,10 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_Mul: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex mult");
+      return ValueCategory(
+          builder.create<mlir::complex::MulOp>(
+              loc, getComplexValue(lhs), getComplexValue(rhs)),
+          /*isReference*/ false);
     }
     auto lhs_v = lhs.getValue(loc, builder);
     if (lhs_v.getType().isa<mlir::FloatType>()) {
@@ -2846,7 +2898,10 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_Div: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex div");
+      return ValueCategory(
+          builder.create<mlir::complex::DivOp>(
+              loc, getComplexValue(lhs), getComplexValue(rhs)),
+          /*isReference*/ false);
     }
     auto lhs_v = lhs.getValue(loc, builder);
     if (lhs_v.getType().isa<mlir::FloatType>()) {
@@ -2895,14 +2950,11 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
           builder.create<polygeist::SubIndexOp>(loc, mt0, mr, ptradd),
           /*isReference*/ false);
     };
-    if (auto cty = dyn_cast<clang::ComplexType>(BO->getType())) {
-      mlir::Value real =
-          builder.create<AddFOp>(loc, getComplexPart(loc, lhs.val, 0),
-                                 getComplexPart(loc, rhs.val, 0));
-      mlir::Value imag =
-          builder.create<AddFOp>(loc, getComplexPart(loc, lhs.val, 1),
-                                 getComplexPart(loc, rhs.val, 1));
-      return createComplexFloat(loc, real, imag, BO->getType());
+    if (isa<clang::ComplexType>(BO->getType())) {
+      return ValueCategory(
+          builder.create<mlir::complex::AddOp>(
+              loc, getComplexValue(lhs), getComplexValue(rhs)),
+          /*isReference*/ false);
     }
 
     auto lhs_v = lhs.getValue(loc, builder);
@@ -2935,7 +2987,10 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_Sub: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex sub");
+      return ValueCategory(
+          builder.create<mlir::complex::SubOp>(
+              loc, getComplexValue(lhs), getComplexValue(rhs)),
+          /*isReference*/ false);
     }
     auto lhs_v = lhs.getValue(loc, builder);
     auto rhs_v = rhs.getValue(loc, builder);
@@ -3032,14 +3087,8 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
 
     mlir::Value result;
     if (isa<clang::ComplexType>(BO->getType())) {
-      mlir::Value prev = lhs.val;
-      mlir::Value rhsV = rhs.val;
-      mlir::Value real = builder.create<AddFOp>(
-          loc, getComplexPart(loc, prev, 0), getComplexPart(loc, rhsV, 0));
-      mlir::Value imag = builder.create<AddFOp>(
-          loc, getComplexPart(loc, prev, 1), getComplexPart(loc, rhsV, 1));
-      result = createComplexFloat(loc, real, imag, BO->getType())
-                   .getValue(loc, builder);
+      result = builder.create<mlir::complex::AddOp>(
+          loc, getComplexValue(lhs), getComplexValue(rhs));
       lhs.store(loc, builder, result);
       return lhs;
     }
@@ -3093,7 +3142,11 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_SubAssign: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex sub");
+      assert(lhs.isReference);
+      mlir::Value result = builder.create<mlir::complex::SubOp>(
+          loc, getComplexValue(lhs), getComplexValue(rhs));
+      lhs.store(loc, builder, result);
+      return lhs;
     }
     assert(lhs.isReference);
     auto prev = lhs.getValue(loc, builder);
@@ -3125,7 +3178,11 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_MulAssign: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex mult");
+      assert(lhs.isReference);
+      mlir::Value result = builder.create<mlir::complex::MulOp>(
+          loc, getComplexValue(lhs), getComplexValue(rhs));
+      lhs.store(loc, builder, result);
+      return lhs;
     }
     assert(lhs.isReference);
     auto prev = lhs.getValue(loc, builder);
@@ -3157,7 +3214,11 @@ ValueCategory MLIRScanner::VisitBinaryOperator(clang::BinaryOperator *BO) {
   }
   case clang::BinaryOperator::Opcode::BO_DivAssign: {
     if (isa<clang::ComplexType>(BO->getType())) {
-      llvm_unreachable("Unhandled complex div");
+      assert(lhs.isReference);
+      mlir::Value result = builder.create<mlir::complex::DivOp>(
+          loc, getComplexValue(lhs), getComplexValue(rhs));
+      lhs.store(loc, builder, result);
+      return lhs;
     }
     assert(lhs.isReference);
     auto prev = lhs.getValue(loc, builder);
@@ -4110,12 +4171,10 @@ ValueCategory MLIRScanner::VisitCastExpr(CastExpr *E) {
     if (isArray)
       return prev;
 
+    if (!prev.isReference)
+      return prev;
+
     auto lres = prev.getValue(loc, builder);
-    if (!prev.isReference) {
-      E->dump();
-      lres.dump();
-    }
-    assert(prev.isReference);
     return ValueCategory(lres, /*isReference*/ false);
   }
   case clang::CastKind::CK_IntegralToFloating: {
@@ -4257,25 +4316,11 @@ ValueCategory MLIRScanner::VisitCastExpr(CastExpr *E) {
   }
   case clang::CastKind::CK_FloatingComplexCast: {
     auto sub = Visit(E->getSubExpr());
-    auto complex = sub.val;
-    mlir::FloatType prevScalarTy;
-    mlir::FloatType postScalarTy;
+    auto complex = sub.getValue(loc, builder);
     auto prevTy = complex.getType();
     auto postTy = getMLIRType(E->getType());
-    if (auto mt = dyn_cast<MemRefType>(postTy)) {
-      postScalarTy = mt.getElementType().cast<mlir::FloatType>();
-    } else if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(postTy)) {
-      postScalarTy = ST.getBody()[0].cast<mlir::FloatType>();
-    } else {
-      llvm_unreachable("unexpected complex type\n");
-    }
-    if (auto mt = dyn_cast<MemRefType>(prevTy)) {
-      prevScalarTy = mt.getElementType().cast<mlir::FloatType>();
-    } else if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(prevTy)) {
-      prevScalarTy = ST.getBody()[0].cast<mlir::FloatType>();
-    } else {
-      llvm_unreachable("unexpected complex type\n");
-    }
+    mlir::FloatType prevScalarTy = getComplexElementType(prevTy);
+    mlir::FloatType postScalarTy = getComplexElementType(postTy);
     auto castScalar = [&](mlir::Value complex, int fnum) -> mlir::Value {
       mlir::Value scalar = getComplexPart(loc, complex, fnum);
       assert(scalar);
@@ -4424,22 +4469,8 @@ ValueCategory MLIRScanner::VisitCastExpr(CastExpr *E) {
   }
   case clang::CastKind::CK_FloatingRealToComplex: {
     auto sub = Visit(E->getSubExpr());
-    auto complex = sub.val;
-    auto convertedType = getMLIRType(E->getType());
     auto real = sub.getValue(loc, builder);
-    mlir::FloatType fty;
-    if (auto mt = dyn_cast<MemRefType>(convertedType)) {
-      auto elty = mt.getElementType();
-      if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(elty)) {
-        fty = ST.getBody()[0].cast<FloatType>();
-      } else {
-        fty = elty.cast<FloatType>();
-      }
-    } else if (auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(convertedType)) {
-      fty = ST.getBody()[0].cast<FloatType>();
-    } else {
-      llvm_unreachable("unexpected complex type");
-    }
+    auto fty = getComplexElementType(getMLIRType(E->getType()));
     auto zero = builder.create<ConstantFloatOp>(
         loc, APFloat(fty.getFloatSemantics(), "0"), fty);
     return createComplexFloat(loc, real, zero, E->getType());
@@ -5530,14 +5561,8 @@ mlir::Type MLIRASTConsumer::getMLIRType(clang::QualType qt, bool *implicitRef,
     bool assumeRef = false;
     auto subType =
         getMLIRType(CT->getElementType(), &assumeRef, /*allowMerge*/ false);
-    if (CombinedStructABI && memRefABI && allowMerge) {
-      assert(!assumeRef);
-      if (implicitRef)
-        *implicitRef = true;
-      return mlir::MemRefType::get(2, subType);
-    }
-    mlir::Type types[2] = {subType, subType};
-    return mlir::LLVM::LLVMStructType::getLiteral(module->getContext(), types);
+    assert(!assumeRef);
+    return mlir::ComplexType::get(subType);
   }
   if (auto RT = dyn_cast<clang::RecordType>(qt)) {
     if (RT->getDecl()->isInvalidDecl()) {

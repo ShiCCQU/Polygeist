@@ -14,6 +14,7 @@
 #include "mlir/../../lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp"
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -27,6 +28,7 @@
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/Passes.h"
@@ -2866,6 +2868,7 @@ struct ConvertPolygeistToLLVMPass
       populateMathToLLVMConversionPatterns(converter, patterns);
       populateOpenMPToLLVMConversionPatterns(converter, patterns);
       arith::populateArithToLLVMConversionPatterns(converter, patterns);
+      populateComplexToLLVMConversionPatterns(converter, patterns);
 
       bool kernelBarePtrCallConv = false;
       // Our custom versions of the gpu patterns
@@ -2925,6 +2928,7 @@ struct ConvertPolygeistToLLVMPass
           [&](Operation *op) { return converter.isLegal(&op->getRegion(0)); });
       target.addIllegalOp<scf::ForOp, scf::IfOp, scf::ParallelOp, scf::WhileOp,
                           scf::ExecuteRegionOp, func::FuncOp>();
+      target.addIllegalDialect<complex::ComplexDialect>();
       target.addLegalOp<omp::TerminatorOp, omp::TaskyieldOp, omp::FlushOp,
                         omp::YieldOp, omp::BarrierOp, omp::TaskwaitOp>();
       target.addDynamicallyLegalDialect<LLVM::LLVMDialect>(

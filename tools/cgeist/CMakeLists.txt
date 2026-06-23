@@ -84,6 +84,7 @@ list(APPEND CGEIST_LIBS
   MLIRSupport
   MLIRIR
   MLIRAnalysis
+  MLIRComplexDialect
   MLIRLLVMDialect
   MLIRNVVMDialect
   MLIROpenMPDialect

@@ -33,6 +33,7 @@
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -550,6 +551,7 @@ int main(int argc, char **argv) {
   context.getOrLoadDialect<DLTIDialect>();
   context.getOrLoadDialect<mlir::scf::SCFDialect>();
   context.getOrLoadDialect<mlir::async::AsyncDialect>();
+  context.getOrLoadDialect<mlir::complex::ComplexDialect>();
   context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
   context.getOrLoadDialect<mlir::NVVM::NVVMDialect>();
   context.getOrLoadDialect<mlir::ROCDL::ROCDLDialect>();
